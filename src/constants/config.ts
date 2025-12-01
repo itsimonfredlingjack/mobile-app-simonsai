@@ -1,0 +1,8 @@
+export const CONFIG = {
+  BACKEND_URL: 'http://192.168.86.26:8000',
+  WEBSOCKET_URL: 'ws://192.168.86.26:8000/api/chat',
+  WHISPER_URL: 'http://192.168.86.26:8001',
+  PROFILE: 'qwen',
+  RECONNECT_DELAY: 3000,
+  MAX_RECONNECT_ATTEMPTS: 10,
+};

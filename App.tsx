@@ -1,825 +1,738 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { StatusBar } from 'expo-status-bar';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   StyleSheet,
-  Text,
   View,
-  Keyboard,
-  Dimensions,
-  Platform,
-  Animated as RNAnimated,
-  Pressable,
+  Text,
+  TouchableOpacity,
+  TextInput,
+  Animated,
+  Easing,
+  StatusBar,
   KeyboardAvoidingView,
+  Platform,
+  Keyboard,
+  ScrollView,
+  Alert,
 } from 'react-native';
-import { Audio } from 'expo-av';
-import * as Speech from 'expo-speech';
-import NetInfo from '@react-native-community/netinfo';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Mic, Send, Terminal, Cpu, Activity, Wifi, RefreshCw } from 'lucide-react-native';
 
-// ═══════════════════════════════════════════════════════════════
-// DYNAMIC IDENTITY - Simons AI
-// UI morphar baserat på vald agent
-// ═══════════════════════════════════════════════════════════════
+import { useWarRoomSocket } from './src/hooks/useWarRoomSocket';
+import { useVoiceInput } from './src/hooks/useVoiceInput';
 
-import { ThemeProvider, useTheme, AgentType } from './contexts/ThemeContext';
-import ReactiveCore from './components/ReactiveCore';
-import { ChatHistory } from './components/ChatBubble';
-import InputZone from './components/InputZone';
-import AgentToggle from './components/AgentToggle';
-import ServerHealthWidget from './components/ServerHealthWidget';
-import TerminalOutput from './components/TerminalOutput';
-import QuickActions from './components/QuickActions';
-
-const BACKEND_URL = 'http://192.168.86.26:8000';
-const WHISPER_URL = 'http://192.168.86.26:8001';
-
-// Shell command result type
-type ShellResult = {
-  command: string;
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  durationMs: number;
-  requiresConfirmation?: boolean;
-  message?: string;
+// --- THEME ---
+const THEME = {
+  bg: '#050B14',
+  accent: '#00F3FF',
+  secondary: '#0A1A2F',
+  danger: '#FF2A6D',
+  success: '#34d399',
+  text: '#E0E6ED',
+  textDim: '#445566',
+  glass: 'rgba(10, 26, 47, 0.8)',
 };
 
-// Voice command definitions with multiple trigger variations
-const VOICE_COMMANDS = [
-  {
-    triggers: ['statusrapport', 'status rapport', 'startes rapport', 'startes rapportu', 'status rapportu', 'status report', 'visa status'],
-    action: 'status'
-  },
-  {
-    triggers: ['starta om backend', 'restart backend', 'starta backend', 'omstart backend', 'restarta backend'],
-    action: 'restart_backend'
-  },
-  {
-    triggers: ['starta om frontend', 'restart frontend', 'starta frontend', 'omstart frontend'],
-    action: 'restart_frontend'
-  },
-  {
-    triggers: ['deploya', 'deploy', 'delpoya', 'publicera', 'uppdatera'],
-    action: 'deploy'
-  },
-];
-
-// Fuzzy command matcher - checks if any trigger is contained in the transcribed text
-const matchVoiceCommand = (transcribedText: string): string | null => {
-  const text = transcribedText.toLowerCase().trim();
-
-  for (const cmd of VOICE_COMMANDS) {
-    for (const trigger of cmd.triggers) {
-      // Check if trigger words are in the text (fuzzy)
-      const triggerWords = trigger.split(' ');
-      const matchCount = triggerWords.filter(word => text.includes(word)).length;
-
-      // If most words match, consider it a match (60% threshold)
-      if (matchCount >= Math.ceil(triggerWords.length * 0.6)) {
-        return cmd.action;
-      }
-    }
-  }
-  return null;
-};
-
-// Check if input is a shell command (starts with $)
-const isShellCommand = (text: string): boolean => {
-  return text.trim().startsWith('$');
-};
-
-// Types
-type HistoryMessage = {
+// --- INTERFACES ---
+interface Message {
+  id: string;
   role: 'user' | 'assistant';
   content: string;
-};
-
-type CoreState = 'idle' | 'listening' | 'processing';
-
-// ═══════════════════════════════════════════════════════════════
-// LOADING ANIMATION
-// ═══════════════════════════════════════════════════════════════
-
-function LoadingIndicator() {
-  const { theme, currentAgent } = useTheme();
-  const opacityAnim = useRef(new RNAnimated.Value(1)).current;
-
-  useEffect(() => {
-    const animation = RNAnimated.loop(
-      RNAnimated.sequence([
-        RNAnimated.timing(opacityAnim, {
-          toValue: 0.3,
-          duration: 800,
-          useNativeDriver: true,
-        }),
-        RNAnimated.timing(opacityAnim, {
-          toValue: 1,
-          duration: 800,
-          useNativeDriver: true,
-        }),
-      ])
-    );
-    animation.start();
-    return () => animation.stop();
-  }, []);
-
-  const text = currentAgent === 'qwen' ? 'QWEN analyserar...' : 'NERDY analyserar...';
-
-  return (
-    <RNAnimated.Text
-      style={[
-        styles.loadingText,
-        {
-          opacity: opacityAnim,
-          color: theme.colors.accent,
-          fontFamily: theme.typography === 'monospace' ? 'monospace' : undefined,
-        },
-      ]}
-    >
-      {text}
-    </RNAnimated.Text>
-  );
+  timestamp: number;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MAIN APP CONTENT
-// ═══════════════════════════════════════════════════════════════
+// --- COMPONENT: MINI MONOLITH (80px Avatar) ---
+const MiniMonolith = ({ active, size = 80 }: { active: boolean; size?: number }) => {
+  const rotateValue = useRef(new Animated.Value(0)).current;
+  const pulseValue = useRef(new Animated.Value(1)).current;
 
-function AppContent() {
-  const { theme, currentAgent, setAgent, animatedColors } = useTheme();
-
-  const [command, setCommand] = useState('');
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [error, setError] = useState('');
-  const [transcribedText, setTranscribedText] = useState('');
-  const [history, setHistory] = useState<HistoryMessage[]>([]);
-  const [ttsEnabled, setTtsEnabled] = useState(false);
-  const [isOffline, setIsOffline] = useState(false);
-  const [shellResult, setShellResult] = useState<ShellResult | null>(null);
-  const [showHealthWidget, setShowHealthWidget] = useState(true);
-  const [pendingCommand, setPendingCommand] = useState<string | null>(null);
-
-  const recordingRef = useRef<Audio.Recording | null>(null);
-
-  // Determine ReactiveCore state
-  const coreState: CoreState = isRecording ? 'listening' : isProcessing ? 'processing' : 'idle';
-
-  // Begär mikrofon-permission vid start
   useEffect(() => {
-    (async () => {
-      const { status } = await Audio.requestPermissionsAsync();
-      if (status !== 'granted') {
-        setError('MIKROFON NEKAD');
-      }
+    const spin = Animated.loop(
+      Animated.timing(rotateValue, {
+        toValue: 1,
+        duration: active ? 3000 : 6000,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      })
+    );
+    spin.start();
+    return () => spin.stop();
+  }, [active, rotateValue]);
 
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-    })();
-  }, []);
-
-  // Network monitoring
   useEffect(() => {
-    const unsubscribe = NetInfo.addEventListener(state => {
-      setIsOffline(!state.isConnected);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  // Execute shell command
-  const executeShellCommand = useCallback(async (cmd: string, confirmed: boolean = false) => {
-    setIsProcessing(true);
-    setError('');
-    setShellResult(null);
-
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/shell/execute`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          command: cmd,
-          confirmed,
-        }),
-      });
-
-      const data = await res.json();
-
-      if (data.requires_confirmation) {
-        // Store pending command for confirmation
-        setPendingCommand(cmd);
-        setError(currentAgent === 'qwen'
-          ? `BEKRÄFTA: ${data.message}`
-          : `Bekräfta: ${data.message}`);
-        setIsProcessing(false);
-        return;
-      }
-
-      setShellResult({
-        command: data.command || cmd,
-        stdout: data.stdout || '',
-        stderr: data.stderr || '',
-        exitCode: data.exit_code ?? -1,
-        durationMs: data.duration_ms || 0,
-      });
-
-      setCommand('');
-      setPendingCommand(null);
-    } catch (e: any) {
-      setError(currentAgent === 'qwen' ? 'SHELL-FEL' : 'Shell error');
-    } finally {
-      setIsProcessing(false);
-    }
-  }, [currentAgent]);
-
-  // Confirm pending dangerous command
-  const confirmPendingCommand = useCallback(async () => {
-    if (pendingCommand) {
-      setError('');
-      await executeShellCommand(pendingCommand, true);
-    }
-  }, [pendingCommand, executeShellCommand]);
-
-  // Cancel pending command
-  const cancelPendingCommand = useCallback(() => {
-    setPendingCommand(null);
-    setError('');
-  }, []);
-
-  // Check for voice commands using fuzzy matching
-  const checkVoiceCommand = useCallback((text: string): boolean => {
-    const matchedAction = matchVoiceCommand(text);
-
-    if (!matchedAction) {
-      return false;
-    }
-
-    // Execute action based on match
-    switch (matchedAction) {
-      case 'status':
-        setShowHealthWidget(true);
-        return true;
-
-      case 'restart_backend':
-        executeShellCommand('sudo systemctl restart simons-ai-backend', false);
-        return true;
-
-      case 'restart_frontend':
-        executeShellCommand('sudo systemctl restart simons-ai-frontend', false);
-        return true;
-
-      case 'deploy':
-        // Add deploy logic here if needed
-        setError(currentAgent === 'qwen' ? 'DEPLOY EJ IMPLEMENTERAD' : 'Deploy inte implementerad');
-        return true;
-
-      default:
-        return false;
-    }
-  }, [executeShellCommand, currentAgent]);
-
-  // Command execution
-  const executeCommand = useCallback(async () => {
-    if (!command.trim() || isProcessing) return;
-
-    const userMessage = command.trim();
-    Keyboard.dismiss();
-
-    // Check if it's a shell command
-    if (isShellCommand(userMessage)) {
-      await executeShellCommand(userMessage);
-      return;
-    }
-
-    // Check for voice commands in text
-    if (checkVoiceCommand(userMessage)) {
-      setCommand('');
-      return;
-    }
-
-    setIsProcessing(true);
-    setError('');
-    setTranscribedText('');
-
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/voice-command`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: userMessage,
-          profile: currentAgent,
-        }),
-      });
-
-      if (!res.ok) {
-        setError(`HTTP ${res.status}`);
-        setIsProcessing(false);
-        return;
-      }
-
-      const data = await res.json();
-      const aiResponse = data.response || 'INGEN RESPONS';
-
-      // Add to history
-      setHistory(prev => [
-        ...prev,
-        { role: 'user', content: userMessage },
-        { role: 'assistant', content: aiResponse },
-      ]);
-
-      // TTS if enabled
-      if (ttsEnabled && aiResponse) {
-        Speech.speak(aiResponse, { language: 'sv-SE' });
-      }
-
-      setCommand('');
-    } catch (e: any) {
-      setError('ANSLUTNINGSFEL');
-    } finally {
-      setIsProcessing(false);
-    }
-  }, [command, isProcessing, currentAgent, ttsEnabled, executeShellCommand, checkVoiceCommand]);
-
-  // ═══════════════════════════════════════════════════════════════
-  // RÖSTINSPELNING
-  // ═══════════════════════════════════════════════════════════════
-
-  const startRecording = async () => {
-    try {
-      setError('');
-      setTranscribedText('');
-
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
+    if (active) {
+      const pulse = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseValue, { toValue: 1.1, duration: 400, useNativeDriver: true }),
+          Animated.timing(pulseValue, { toValue: 1.0, duration: 400, useNativeDriver: true }),
+        ])
       );
-
-      recordingRef.current = recording;
-      setIsRecording(true);
-    } catch (err) {
-      setError('KAN INTE STARTA INSPELNING');
-      console.error('Failed to start recording', err);
-    }
-  };
-
-  const stopRecording = async () => {
-    if (!recordingRef.current) return;
-
-    setIsRecording(false);
-    setIsProcessing(true);
-
-    try {
-      await recordingRef.current.stopAndUnloadAsync();
-      const uri = recordingRef.current.getURI();
-      recordingRef.current = null;
-
-      if (!uri) {
-        setError('INGEN LJUDFIL');
-        setIsProcessing(false);
-        return;
-      }
-
-      // Skicka till Whisper-server med vald agent
-      const formData = new FormData();
-      formData.append('audio', {
-        uri: uri,
-        type: 'audio/m4a',
-        name: 'recording.m4a',
-      } as any);
-      formData.append('profile', currentAgent);
-
-      const whisperRes = await fetch(`${WHISPER_URL}/voice-command`, {
-        method: 'POST',
-        body: formData,
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      });
-
-      const data = await whisperRes.json();
-
-      if (data.success) {
-        setTranscribedText(data.transcribed_text || '');
-
-        // Add to history
-        const userText = data.transcribed_text || '';
-        const aiResponse = data.response || 'INGET SVAR';
-
-        setHistory(prev => [
-          ...prev,
-          { role: 'user', content: userText },
-          { role: 'assistant', content: aiResponse },
-        ]);
-
-        // TTS if enabled
-        if (ttsEnabled && aiResponse) {
-          Speech.speak(aiResponse, { language: 'sv-SE' });
-        }
-      } else {
-        setError(data.error || 'TRANSKRIBERING MISSLYCKADES');
-      }
-    } catch (err: any) {
-      setError('SERVER-FEL: ' + (err.message || 'OKÄNT'));
-      console.error('Recording error:', err);
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const toggleRecording = async () => {
-    if (isRecording) {
-      await stopRecording();
+      pulse.start();
+      return () => pulse.stop();
     } else {
-      await startRecording();
+      pulseValue.setValue(1);
     }
-  };
+  }, [active, pulseValue]);
 
-  // ═══════════════════════════════════════════════════════════════
-  // QUICK ACTIONS HANDLERS
-  // ═══════════════════════════════════════════════════════════════
+  const spin = rotateValue.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0deg', '360deg'],
+  });
 
-  const handleStatusPress = useCallback(() => {
-    setShowHealthWidget(prev => !prev);
-  }, []);
-
-  const handleRestartPress = useCallback(async () => {
-    // Show confirmation and restart backend
-    await executeShellCommand('sudo systemctl restart simons-ai-backend', false);
-  }, [executeShellCommand]);
-
-  const handleDeployPress = useCallback(() => {
-    // For now, show alert - can be expanded later
-    setError(currentAgent === 'qwen' ? 'DEPLOY EJ IMPLEMENTERAD' : 'Deploy inte implementerad');
-  }, [currentAgent]);
-
-  const handleShellPress = useCallback(() => {
-    // Prefill input with shell prompt
-    setCommand('$ ');
-  }, []);
+  const Plane = ({ rotateVal, color, planeSize }: { rotateVal: any; color: string; planeSize: number }) => (
+    <Animated.View
+      style={[
+        styles.plane,
+        {
+          width: planeSize,
+          height: planeSize,
+          borderColor: color,
+          transform: [
+            { rotateX: '45deg' },
+            { rotateY: rotateVal },
+            { rotateZ: rotateVal },
+            { scale: pulseValue },
+          ],
+        },
+      ]}
+    />
+  );
 
   return (
-    <KeyboardAvoidingView
-      style={{ flex: 1 }}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-    >
-      <RNAnimated.View
-        style={[
-          styles.container,
-          { backgroundColor: theme.colors.background },
-        ]}
-      >
-        <StatusBar style="light" />
-
-      {/* ═══ OFFLINE INDICATOR ═══ */}
-      {isOffline && (
-        <View
-          style={[
-            styles.offlineBanner,
-            {
-              backgroundColor: '#ef4444',
-              borderRadius: theme.borderRadius,
-            },
-          ]}
-        >
-          <Text
-            style={[
-              styles.offlineText,
-              { fontFamily: theme.typography === 'monospace' ? 'monospace' : undefined },
-            ]}
-          >
-            {currentAgent === 'qwen' ? '⚠ OFFLINE' : '⚠ Offline'}
-          </Text>
-        </View>
-      )}
-
-      {/* ═══ AGENT TOGGLE ═══ */}
-      <AgentToggle disabled={isProcessing || isRecording} />
-
-      {/* ═══ SERVER HEALTH WIDGET ═══ */}
-      {showHealthWidget && currentAgent === 'qwen' && (
-        <ServerHealthWidget initialExpanded={false} />
-      )}
-
-      {/* ═══ QUICK ACTIONS ═══ */}
-      <QuickActions
-        onStatusPress={handleStatusPress}
-        onRestartPress={handleRestartPress}
-        onDeployPress={handleDeployPress}
-        onShellPress={handleShellPress}
+    <View style={[styles.miniMonolith, { width: size, height: size }]}>
+      <Plane rotateVal={spin} color={THEME.accent} planeSize={size * 0.9} />
+      <Plane
+        rotateVal={rotateValue.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '-360deg'] })}
+        color="rgba(0, 243, 255, 0.4)"
+        planeSize={size * 0.65}
       />
+      <Plane
+        rotateVal={rotateValue.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '180deg'] })}
+        color="rgba(0, 243, 255, 0.2)"
+        planeSize={size * 0.4}
+      />
+      <View style={[styles.miniCore, active && styles.miniCoreActive, { width: size * 0.15, height: size * 0.15, borderRadius: size * 0.075 }]} />
+    </View>
+  );
+};
 
-      {/* ═══ REACTIVE CORE ═══ */}
-      <View style={styles.coreSection} pointerEvents="none">
-        <ReactiveCore agent={currentAgent} state={coreState} />
-        {isRecording && (
-          <Text
-            style={[
-              styles.stateLabel,
-              {
-                color: theme.colors.accent,
-                fontFamily: theme.typography === 'monospace' ? 'monospace' : undefined,
-              },
-            ]}
-          >
-            {currentAgent === 'qwen' ? 'SPELAR IN...' : 'Spelar in...'}
-          </Text>
-        )}
-        {isProcessing && !isRecording && <LoadingIndicator />}
+// --- COMPONENT: SYSTEM HUD ---
+const SystemHUD = ({ isConnected, onReconnect }: { isConnected: boolean; onReconnect: () => void }) => {
+  const insets = useSafeAreaInsets();
+
+  return (
+    <View style={[styles.hudContainer, { paddingTop: insets.top + 8 }]}>
+      <TouchableOpacity style={styles.hudLeft} onPress={onReconnect}>
+        <Activity size={14} color={isConnected ? THEME.accent : THEME.danger} />
+        <Text style={[styles.hudText, !isConnected && { color: THEME.danger }]}>
+          {isConnected ? 'ONLINE' : 'OFFLINE'}
+        </Text>
+      </TouchableOpacity>
+      <View style={styles.hudCenter}>
+        <View style={styles.agentBadge}>
+          <Cpu size={12} color="#000" />
+          <Text style={styles.agentText}>QWEN 3</Text>
+        </View>
       </View>
+      <View style={styles.hudRight}>
+        <Text style={[styles.hudText, !isConnected && { color: THEME.danger }]}>
+          NET: {isConnected ? 'UP' : 'DOWN'}
+        </Text>
+        <Wifi size={14} color={isConnected ? THEME.accent : THEME.danger} />
+      </View>
+    </View>
+  );
+};
 
-      {/* ═══ TERMINAL OUTPUT ═══ */}
-      {shellResult && (
-        <TerminalOutput
-          command={shellResult.command}
-          output={shellResult.stdout}
-          error={shellResult.stderr}
-          exitCode={shellResult.exitCode}
-          durationMs={shellResult.durationMs}
-          onClose={() => setShellResult(null)}
-        />
+// --- COMPONENT: ERROR TOAST ---
+const ErrorToast = ({ message, onDismiss }: { message: string; onDismiss: () => void }) => (
+  <View style={styles.errorToast}>
+    <Text style={styles.errorText}>⚠️ {message}</Text>
+    <TouchableOpacity onPress={onDismiss} style={styles.errorDismiss}>
+      <Text style={styles.errorDismissText}>✕</Text>
+    </TouchableOpacity>
+  </View>
+);
+
+// --- MAIN APP CONTENT ---
+const AppContent = () => {
+  const insets = useSafeAreaInsets();
+  const scrollViewRef = useRef<ScrollView>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [inputText, setInputText] = useState('');
+  const [showInput, setShowInput] = useState(false);
+  const [wsKey, setWsKey] = useState(0); // For reconnect
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Hooks
+  const {
+    isConnected,
+    isStreaming,
+    isSending,
+    streamingText,
+    sendMessage: socketSendMessage,
+  } = useWarRoomSocket({
+    onMessageComplete: (text: string) => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: text,
+          timestamp: Date.now(),
+        },
+      ]);
+    },
+    onError: (error: string) => {
+      setErrorMessage(error);
+      // Auto-dismiss after 5 seconds
+      setTimeout(() => setErrorMessage(null), 5000);
+    },
+  });
+
+  const [lastTranscription, setLastTranscription] = useState<string | null>(null);
+
+  const { isRecording, isTranscribing, startRecording, stopRecording } = useVoiceInput({
+    onTranscriptionComplete: (text: string) => {
+      console.log('[APP] Voice transcription received:', text);
+      if (text.trim()) {
+        setLastTranscription(text);  // Visa vad som hördes
+        handleSendMessage(text);
+        // Rensa efter 3 sekunder
+        setTimeout(() => setLastTranscription(null), 3000);
+      }
+    },
+    onError: (error: string) => {
+      console.error('[APP] Voice error:', error);
+      setErrorMessage(error);
+      setTimeout(() => setErrorMessage(null), 5000);
+    },
+  });
+
+  const isActive = isRecording || isTranscribing || isSending || isStreaming;
+
+  // Get current status text for UI
+  const getStatusText = () => {
+    if (isRecording) return '🔴 Recording...';
+    if (isTranscribing) return '🎤 Processing voice...';
+    if (lastTranscription) return `📝 Heard: "${lastTranscription.slice(0, 30)}..."`;
+    if (isSending) return '📤 Sending to QWEN...';
+    if (isStreaming) return '💬 QWEN is responding...';
+    return 'Ready';
+  };
+
+  // Auto-scroll on new messages
+  useEffect(() => {
+    setTimeout(() => {
+      scrollViewRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+  }, [messages, streamingText]);
+
+  const handleSendMessage = useCallback((text: string) => {
+    const trimmedText = text.trim();
+    if (!trimmedText) return;
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: trimmedText,
+      timestamp: Date.now(),
+    };
+    setMessages((prev) => [...prev, userMessage]);
+    socketSendMessage(trimmedText);
+    setInputText('');
+    setShowInput(false);
+    Keyboard.dismiss();
+  }, [socketSendMessage]);
+
+  const handleMicPress = useCallback(() => {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  }, [isRecording, startRecording, stopRecording]);
+
+  const handleReconnect = useCallback(() => {
+    setWsKey(prev => prev + 1);
+    Alert.alert('Reconnecting', 'Attempting to reconnect to server...');
+  }, []);
+
+  const handleCmd = useCallback(() => {
+    Alert.alert(
+      'QWEN Tools',
+      'Select action:',
+      [
+        {
+          text: 'Reconnect',
+          onPress: handleReconnect
+        },
+        {
+          text: 'Clear Chat',
+          onPress: () => setMessages([])
+        },
+        {
+          text: 'Server Info',
+          onPress: () => Alert.alert('Server', `Status: ${isConnected ? 'Connected' : 'Disconnected'}\nIP: 192.168.86.26:8000`)
+        },
+        { text: 'Cancel', style: 'cancel' },
+      ]
+    );
+  }, [handleReconnect, isConnected]);
+
+  return (
+    <View style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor={THEME.bg} />
+
+      {/* Error Toast */}
+      {errorMessage && (
+        <ErrorToast message={errorMessage} onDismiss={() => setErrorMessage(null)} />
       )}
 
-      {/* ═══ ERROR DISPLAY ═══ */}
-      {error && (
-        <View
-          style={[
-            styles.errorContainer,
-            {
-              backgroundColor: theme.colors.surface,
-              borderRadius: theme.borderRadius,
-              borderColor: pendingCommand ? theme.colors.accent : '#ef4444',
-            },
-          ]}
-        >
-          <Text
-            style={[
-              styles.errorText,
-              {
-                color: pendingCommand ? theme.colors.accent : '#ef4444',
-                fontFamily: theme.typography === 'monospace' ? 'monospace' : undefined,
-              },
-            ]}
-          >
-            {error}
-          </Text>
+      {/* 1. TOP HUD */}
+      <SystemHUD isConnected={isConnected} onReconnect={handleReconnect} />
 
-          {/* Confirmation buttons for dangerous commands */}
-          {pendingCommand && (
-            <View style={styles.confirmButtons}>
-              <Pressable
-                style={[
-                  styles.confirmButton,
-                  { backgroundColor: theme.colors.accent, borderRadius: theme.borderRadius },
-                ]}
-                onPress={confirmPendingCommand}
-              >
-                <Text style={[styles.confirmButtonText, { color: theme.colors.background }]}>
-                  {currentAgent === 'qwen' ? 'BEKRÄFTA' : 'Bekräfta'}
-                </Text>
-              </Pressable>
-              <Pressable
-                style={[
-                  styles.confirmButton,
-                  styles.cancelButton,
-                  { borderColor: theme.colors.dimmed, borderRadius: theme.borderRadius },
-                ]}
-                onPress={cancelPendingCommand}
-              >
-                <Text style={[styles.confirmButtonText, { color: theme.colors.dimmed }]}>
-                  {currentAgent === 'qwen' ? 'AVBRYT' : 'Avbryt'}
-                </Text>
-              </Pressable>
-            </View>
-          )}
-        </View>
-      )}
-
-      {/* ═══ TRANSCRIBED TEXT ═══ */}
-      {transcribedText && !error && (
-        <View
-          style={[
-            styles.transcribedContainer,
-            {
-              backgroundColor: theme.colors.surface,
-              borderRadius: theme.borderRadius,
-            },
-          ]}
-        >
-          <Text
-            style={[
-              styles.transcribedText,
-              {
-                color: theme.colors.accent,
-                fontFamily: theme.typography === 'monospace' ? 'monospace' : undefined,
-              },
-            ]}
-          >
-            "{transcribedText}"
-          </Text>
-        </View>
-      )}
-
-      {/* ═══ CHAT HISTORY ═══ */}
-      <View
-        style={[
-          styles.chatSection,
-          {
-            backgroundColor: theme.colors.background,
-            borderColor: theme.colors.dimmed,
-            borderRadius: theme.borderRadius,
-          },
-        ]}
+      {/* 2. MAIN CONTENT - Chat ScrollView with flex:1 */}
+      <ScrollView
+        ref={scrollViewRef}
+        style={styles.chatContainer}
+        contentContainerStyle={styles.chatContent}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
       >
-        {history.length > 0 ? (
-          <ChatHistory messages={history} />
-        ) : (
-          <View style={styles.emptyState}>
-            <Text
-              style={[
-                styles.emptyText,
-                {
-                  color: theme.colors.dimmed,
-                  fontFamily: theme.typography === 'monospace' ? 'monospace' : undefined,
-                },
-              ]}
-            >
-              {currentAgent === 'qwen' ? '// VÄNTAR PÅ INPUT' : 'Väntar på meddelande...'}
+        {/* Avatar Row with Mini-Monolith */}
+        <View style={styles.avatarRow}>
+          <MiniMonolith active={isActive} size={80} />
+          <View style={styles.avatarInfo}>
+            <Text style={styles.terminalTitle}>QWEN 3 // TERMINAL</Text>
+            <Text style={styles.terminalSubtitle}>
+              {getStatusText()}
+            </Text>
+          </View>
+        </View>
+
+        {/* Welcome message if empty */}
+        {messages.length === 0 && !streamingText && (
+          <View style={styles.welcomeBox}>
+            <Text style={styles.welcomeText}>
+              <Text style={{ color: THEME.accent }}>{'>'} </Text>
+              Initializing QWEN core...
+            </Text>
+            <Text style={[styles.welcomeText, { color: THEME.textDim }]}>
+              ... Connection {isConnected ? 'established' : 'pending'}
+            </Text>
+            <Text style={[styles.welcomeText, { color: THEME.textDim }]}>
+              ... Press MIC to speak or Terminal to type
             </Text>
           </View>
         )}
-      </View>
 
-      {/* ═══ INPUT ZONE ═══ */}
-      <InputZone
-        value={command}
-        onChangeText={setCommand}
-        onSubmit={executeCommand}
-        onMicPress={toggleRecording}
-        isRecording={isRecording}
-        isProcessing={isProcessing}
-      />
+        {/* Chat Messages */}
+        {messages.map((msg) => (
+          <View key={msg.id} style={styles.messageRow}>
+            <Text style={styles.messageText}>
+              <Text style={{ color: msg.role === 'user' ? THEME.success : THEME.accent }}>
+                {msg.role === 'user' ? '> ' : 'QWEN > '}
+              </Text>
+              {msg.content}
+            </Text>
+          </View>
+        ))}
 
-      {/* ═══ STATUS BAR ═══ */}
-      <View style={styles.statusBar}>
-        <View
-          style={[
-            styles.statusDot,
-            {
-              backgroundColor: isRecording
-                ? '#ef4444'
-                : isProcessing
-                ? theme.colors.accent
-                : '#22c55e',
-            },
-          ]}
-        />
-        <Text
-          style={[
-            styles.statusText,
-            {
-              color: theme.colors.dimmed,
-              fontFamily: theme.typography === 'monospace' ? 'monospace' : undefined,
-            },
-          ]}
-        >
-          {isRecording
-            ? currentAgent === 'qwen'
-              ? 'SPELAR IN'
-              : 'Spelar in'
-            : isProcessing
-            ? currentAgent === 'qwen'
-              ? 'BEARBETAR'
-              : 'Bearbetar'
-            : currentAgent === 'qwen'
-            ? 'REDO'
-            : 'Redo'}
-        </Text>
-      </View>
-    </RNAnimated.View>
-    </KeyboardAvoidingView>
+        {/* Streaming Response */}
+        {streamingText && (
+          <View style={styles.messageRow}>
+            <Text style={styles.messageText}>
+              <Text style={{ color: THEME.accent }}>QWEN {'>'} </Text>
+              {streamingText}
+              <Text style={{ color: THEME.accent }}>_</Text>
+            </Text>
+          </View>
+        )}
+      </ScrollView>
+
+      {/* 3. CONTROL DECK - Fixed at bottom with safe area */}
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={0}
+      >
+        <View style={[styles.controlDeck, { paddingBottom: insets.bottom + 10 }]}>
+          {/* Voice Status Indicator */}
+          {(isRecording || isTranscribing || lastTranscription) && (
+            <View style={styles.voiceStatusBar}>
+              <Text style={styles.voiceStatusText}>
+                {isRecording ? '🔴 RECORDING...' :
+                 isTranscribing ? '🎤 PROCESSING...' :
+                 lastTranscription ? `📝 "${lastTranscription}"` : ''}
+              </Text>
+            </View>
+          )}
+
+          {/* Input Field (shown when active) */}
+          {showInput && (
+            <View style={styles.inputRow}>
+              <Terminal size={18} color={THEME.accent} />
+              <TextInput
+                style={styles.textInput}
+                placeholder="Type command..."
+                placeholderTextColor={THEME.textDim}
+                value={inputText}
+                onChangeText={setInputText}
+                autoFocus={true}
+                onSubmitEditing={() => handleSendMessage(inputText)}
+                returnKeyType="send"
+              />
+              <TouchableOpacity
+                style={[styles.sendBtn, !inputText.trim() && styles.sendBtnDisabled]}
+                onPress={() => handleSendMessage(inputText)}
+                disabled={!inputText.trim()}
+              >
+                <Send size={18} color="#000" />
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* Button Row - Always visible */}
+          <View style={styles.buttonRow}>
+            {/* Terminal Toggle */}
+            <TouchableOpacity
+              style={[styles.sideBtn, showInput && styles.sideBtnActive]}
+              onPress={() => {
+                setShowInput(!showInput);
+                if (showInput) Keyboard.dismiss();
+              }}
+            >
+              <Terminal size={24} color={showInput ? '#000' : THEME.accent} />
+            </TouchableOpacity>
+
+            {/* MIC Button (Hero) */}
+            <TouchableOpacity
+              style={[
+                styles.micButton,
+                isRecording && styles.micButtonRecording,
+                (isSending || isStreaming) && styles.micButtonActive
+              ]}
+              onPress={handleMicPress}
+              activeOpacity={0.8}
+              disabled={isTranscribing || isStreaming || isSending}
+            >
+              <View style={[styles.micInner, isRecording && styles.micInnerActive]}>
+                <Mic size={32} color={isRecording ? THEME.danger : THEME.accent} />
+              </View>
+              {(isTranscribing || isSending) && (
+                <RefreshCw size={16} color={THEME.accent} style={styles.processingIcon} />
+              )}
+            </TouchableOpacity>
+
+            {/* CMD Button */}
+            <TouchableOpacity style={styles.sideBtn} onPress={handleCmd}>
+              <Text style={styles.cmdText}>CMD</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </View>
   );
-}
+};
 
-// ═══════════════════════════════════════════════════════════════
-// APP WITH THEME PROVIDER
-// ═══════════════════════════════════════════════════════════════
-
+// --- MAIN APP ---
 export default function App() {
   return (
-    <ThemeProvider initialAgent="qwen">
+    <SafeAreaProvider>
       <AppContent />
-    </ThemeProvider>
+    </SafeAreaProvider>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════
-// STYLES
-// ═══════════════════════════════════════════════════════════════
-
+// --- STYLESHEET ---
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    paddingTop: 50,
+    backgroundColor: THEME.bg,
   },
-  offlineBanner: {
-    marginHorizontal: 16,
-    paddingVertical: 8,
-    paddingHorizontal: 15,
-    marginBottom: 10,
-  },
-  offlineText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: 'bold',
-    letterSpacing: 2,
-    textAlign: 'center',
-  },
-  coreSection: {
+
+  // HUD
+  hudContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(0, 243, 255, 0.15)',
+    backgroundColor: THEME.bg,
+  },
+  hudLeft: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  hudRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  hudCenter: { position: 'absolute', left: 0, right: 0, alignItems: 'center', top: undefined },
+  hudText: {
+    color: THEME.accent,
+    fontSize: 10,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    letterSpacing: 1,
+    fontWeight: '600',
+  },
+  agentBadge: {
+    flexDirection: 'row',
+    backgroundColor: THEME.accent,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 10,
+    gap: 4,
+    alignItems: 'center',
+  },
+  agentText: { color: '#000', fontWeight: 'bold', fontSize: 10 },
+
+  // CHAT CONTAINER (flex: 1 - takes all available space)
+  chatContainer: {
+    flex: 1,
+    backgroundColor: THEME.bg,
+  },
+  chatContent: {
+    padding: 16,
+    paddingBottom: 20,
+  },
+
+  // AVATAR ROW
+  avatarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 20,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(0, 243, 255, 0.1)',
+  },
+  avatarInfo: {
+    marginLeft: 16,
+    flex: 1,
+  },
+  terminalTitle: {
+    color: THEME.accent,
+    fontSize: 16,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontWeight: '700',
+    letterSpacing: 1,
+  },
+  terminalSubtitle: {
+    color: THEME.textDim,
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    marginTop: 4,
+  },
+
+  // MINI MONOLITH
+  miniMonolith: {
     justifyContent: 'center',
-    height: 180,
-    marginBottom: 10,
+    alignItems: 'center',
   },
-  stateLabel: {
+  plane: {
     position: 'absolute',
-    bottom: 0,
-    fontSize: 10,
-    letterSpacing: 2,
+    borderWidth: 1.5,
   },
-  loadingText: {
-    position: 'absolute',
-    bottom: 0,
-    fontSize: 10,
-    letterSpacing: 2,
+  miniCore: {
+    backgroundColor: THEME.accent,
+    opacity: 0.3,
   },
-  errorContainer: {
-    marginHorizontal: 16,
-    marginBottom: 10,
+  miniCoreActive: {
+    opacity: 1,
+    shadowColor: THEME.accent,
+    shadowOpacity: 0.8,
+    shadowRadius: 15,
+    elevation: 10,
+  },
+
+  // WELCOME BOX
+  welcomeBox: {
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+    borderLeftWidth: 2,
+    borderLeftColor: THEME.accent,
     padding: 12,
+    marginBottom: 16,
+    borderRadius: 4,
+  },
+  welcomeText: {
+    color: THEME.text,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontSize: 13,
+    lineHeight: 20,
+  },
+
+  // MESSAGES
+  messageRow: {
+    marginBottom: 12,
+  },
+  messageText: {
+    color: THEME.text,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontSize: 14,
+    lineHeight: 22,
+  },
+
+  // CONTROL DECK (fixed at bottom)
+  controlDeck: {
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    backgroundColor: 'rgba(5, 11, 20, 0.95)',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(0, 243, 255, 0.2)',
+  },
+
+  // INPUT ROW
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(10, 26, 47, 0.9)',
     borderWidth: 1,
+    borderColor: THEME.accent,
+    borderRadius: 25,
+    paddingHorizontal: 14,
+    height: 50,
+    marginBottom: 12,
+  },
+  textInput: {
+    flex: 1,
+    color: '#FFF',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontSize: 14,
+    marginLeft: 10,
+    paddingVertical: 0,
+  },
+  sendBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: THEME.accent,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  sendBtnDisabled: {
+    backgroundColor: 'rgba(0, 243, 255, 0.3)',
+  },
+
+  // BUTTON ROW
+  buttonRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+
+  // SIDE BUTTONS
+  sideBtn: {
+    width: 50,
+    height: 50,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 25,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 243, 255, 0.3)',
+    backgroundColor: 'rgba(5, 11, 20, 0.9)',
+  },
+  sideBtnActive: {
+    backgroundColor: THEME.accent,
+    borderColor: THEME.accent,
+  },
+  cmdText: {
+    color: THEME.accent,
+    fontSize: 11,
+    fontWeight: 'bold',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+
+  // MIC BUTTON (Hero)
+  micButton: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    borderWidth: 2,
+    borderColor: THEME.accent,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: THEME.accent,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 15,
+    elevation: 8,
+  },
+  micButtonActive: {
+    backgroundColor: 'rgba(0, 243, 255, 0.2)',
+    borderColor: '#FFF',
+    shadowOpacity: 0.8,
+    shadowRadius: 25,
+    elevation: 15,
+  },
+  micInner: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: 'rgba(0, 243, 255, 0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  micInnerActive: {
+    backgroundColor: 'rgba(255, 42, 109, 0.3)',
+  },
+  processingIcon: {
+    position: 'absolute',
+    bottom: -8,
+  },
+
+  // ERROR TOAST
+  errorToast: {
+    position: 'absolute',
+    top: 100,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(255, 42, 109, 0.95)',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    zIndex: 1000,
+    shadowColor: THEME.danger,
+    shadowOpacity: 0.5,
+    shadowRadius: 10,
+    elevation: 10,
   },
   errorText: {
+    color: '#FFF',
     fontSize: 14,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    flex: 1,
+  },
+  errorDismiss: {
+    marginLeft: 10,
+    padding: 4,
+  },
+  errorDismissText: {
+    color: '#FFF',
+    fontSize: 18,
     fontWeight: 'bold',
-    textAlign: 'center',
   },
-  transcribedContainer: {
-    marginHorizontal: 16,
-    marginBottom: 10,
-    padding: 12,
+
+  // MIC RECORDING STATE (red ring)
+  micButtonRecording: {
+    borderColor: THEME.danger,
+    borderWidth: 3,
+    backgroundColor: 'rgba(255, 42, 109, 0.2)',
   },
-  transcribedText: {
-    fontSize: 13,
-    fontStyle: 'italic',
-    textAlign: 'center',
-  },
-  chatSection: {
-    flex: 1,
-    marginHorizontal: 16,
-    marginBottom: 10,
+
+  // VOICE STATUS BAR
+  voiceStatusBar: {
+    backgroundColor: 'rgba(0, 243, 255, 0.15)',
     borderWidth: 1,
-    overflow: 'hidden',
-  },
-  emptyState: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  emptyText: {
-    fontSize: 12,
-  },
-  statusBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingBottom: 30,
-  },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 8,
-  },
-  statusText: {
-    fontSize: 10,
-    letterSpacing: 2,
-  },
-  confirmButtons: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 12,
-    marginTop: 12,
-  },
-  confirmButton: {
-    paddingHorizontal: 20,
+    borderColor: THEME.accent,
+    borderRadius: 8,
     paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 12,
   },
-  cancelButton: {
-    backgroundColor: 'transparent',
-    borderWidth: 1,
-  },
-  confirmButtonText: {
-    fontSize: 12,
-    fontWeight: 'bold',
-    letterSpacing: 1,
+  voiceStatusText: {
+    color: THEME.accent,
+    fontSize: 13,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    textAlign: 'center',
   },
 });

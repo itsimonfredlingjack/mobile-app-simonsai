@@ -1,32 +1,29 @@
 {
   "expo": {
-    "name": "Simons AI",
-    "slug": "simons-ai-app",
+    "name": "Project Monolith",
+    "slug": "project-monolith",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#000000"
+      "backgroundColor": "#0a0f1e"
     },
     "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "com.simons.ai"
+      "supportsTablet": true
     },
     "android": {
+      "package": "com.simons.projectmonolith",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#000000"
+        "backgroundColor": "#0a0f1e"
       },
-      "package": "com.simons.ai",
       "edgeToEdgeEnabled": true,
-      "usesCleartextTraffic": true
+      "softwareKeyboardLayoutMode": "pan"
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
-    }
+    "plugins": []
   }
 }
